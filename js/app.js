@@ -5,6 +5,7 @@
   const SCHEDULE_KEY = 'sunny-home-spurs-v1';
   const SCHEDULE_URL = 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/24/schedule';
   const SCOREBOARD_URL = 'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard';
+  const STANDINGS_URL = 'https://site.api.espn.com/apis/v2/sports/basketball/nba/standings?type=0&level=2';
   const MIGU_URL = 'https://www.miguvideo.com/';
   // Published match IDs from Migu's official schedule, retrieved 2026-11-09.
   // Match on Beijing date, opponent and home/away to distinguish repeat fixtures.
@@ -870,6 +871,40 @@
     }
   }
 
+  let standingsPending = false;
+  let standingsSyncedAt = '';
+
+  async function refreshStandings() {
+    if (activePage !== 'spurs' || document.hidden || standingsPending) return;
+    standingsPending = true;
+    const status = $('#standings-status');
+    try {
+      const data = await fetchEspn(STANDINGS_URL);
+      const table = data.children.find(group => group.name === 'Western Conference')?.standings;
+      const team = table?.entries.find(entry => String(entry.team.id) === '24');
+      const stats = Object.fromEntries((team?.stats || []).map(stat => [stat.name, stat.value]));
+      const { wins, losses, playoffSeed, winPercent } = stats;
+      if (table?.seasonType !== 2 || !table.seasonDisplayName ||
+          ![wins, losses].every(value => Number.isInteger(value) && value >= 0) ||
+          !Number.isFinite(winPercent) || winPercent < 0 || winPercent > 1) {
+        throw new Error('Incomplete standings');
+      }
+      $('#standings-season').textContent = table.seasonDisplayName + ' 常规赛';
+      $('#standings-record').textContent = `${wins} 胜 ${losses} 负`;
+      $('#standings-rank').textContent = Number.isInteger(playoffSeed) && playoffSeed > 0 ? `第 ${playoffSeed} 名` : '待定';
+      $('#standings-pct').textContent = (winPercent * 100).toFixed(1) + '%';
+      const date = dateParts(Date.now());
+      standingsSyncedAt = `${date.year}.${date.month}.${date.day} ${date.hour}:${date.minute}（北京时间）`;
+      status.textContent = '最近同步 ' + standingsSyncedAt;
+    } catch {
+      status.textContent = standingsSyncedAt
+        ? '更新失败，显示上次同步的数据 · ' + standingsSyncedAt
+        : '暂时无法获取排名，将自动重试';
+    } finally {
+      standingsPending = false;
+    }
+  }
+
   function cachedLabel() {
     if (!scheduleUpdatedAt) return '赛程暂不可用，请重试';
     const date = dateParts(scheduleUpdatedAt);
@@ -1007,6 +1042,7 @@
     $('#site-home').hidden = next === 'home';
     document.body.dataset.page = next;
     activePage = next;
+    refreshStandings();
     $$('[data-page]').forEach(view => { view.hidden = view.dataset.page !== next; });
     $$('.main-nav a').forEach(link => {
       const selected = link.getAttribute('href') === `#/${next}`;
@@ -1235,6 +1271,9 @@
   renderRoute(true);
   $('#sync-status').textContent = cachedLabel();
   refreshSchedule(true);
+  setInterval(refreshStandings, 60000);
+  document.addEventListener('visibilitychange', refreshStandings);
+  window.addEventListener('online', refreshStandings);
   setInterval(() => { if (!document.hidden) refreshSchedule(false); }, 60000);
   setInterval(() => { if (!document.hidden) refreshSchedule(true); }, 15 * 60000);
   document.addEventListener('visibilitychange', () => {
