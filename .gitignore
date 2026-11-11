@@ -1,0 +1,16 @@
+# Chrome 浏览器数据
+.taste-skill/
+
+# Node.js 依赖
+node_modules/
+
+# 环境变量
+.env
+.env.*
+
+# 日志
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
