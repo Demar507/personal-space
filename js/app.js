@@ -82,6 +82,7 @@
   let fileRevision = savedContent.dataset.revision || '';
   let fileState = savedContent.textContent.trim() ? JSON.parse(savedContent.textContent) : emptyState();
   const cloudMode = document.documentElement.hasAttribute('data-cloud-moments');
+  const localProfileKey = 'vertex-profile:' + location.pathname;
   const momentsApi = '/api/moments';
   let cloudPosts = [];
   let cloudProfile = null;
@@ -182,15 +183,18 @@
     return { ...saved, profile: { ...DEFAULT_PROFILE, ...saved.profile } };
   }
 
+  function readLocalProfile() {
+    try { return JSON.parse(localStorage.getItem(localProfileKey)); }
+    catch { return null; }
+  }
+
+  let localProfile = cloudMode ? null : readLocalProfile();
+
   function buildHtml(doc, next, revision) {
     const content = doc.querySelector('#site-content');
+    const embedded = content.textContent.trim() ? JSON.parse(content.textContent) : emptyState();
     content.dataset.revision = revision;
-    content.textContent = JSON.stringify(next).replace(/</g, '\\u003c');
-    doc.title = next.profile.siteName + ' · 灵感在此交汇';
-    for (const [attr, value] of [['site-name', next.profile.siteName], ['nickname', next.profile.nickname], ['bio', next.profile.bio]]) {
-      doc.querySelectorAll('[data-' + attr + ']').forEach(node => { node.textContent = value; });
-    }
-    doc.querySelector('.brand').setAttribute('aria-label', next.profile.siteName + '首页');
+    content.textContent = JSON.stringify({ ...next, profile: embedded.profile }).replace(/</g, '\\u003c');
     return '<!doctype html>\n' + doc.documentElement.outerHTML;
   }
 
@@ -346,12 +350,14 @@
 
   function renderContent() {
     if (cloudMode) {
-      state.profile = cloudProfile || { ...DEFAULT_PROFILE, ...fileState.profile };
+      state = { ...state, profile: cloudProfile || { ...DEFAULT_PROFILE, ...fileState.profile } };
       state.posts = cloudPosts.map(post => {
         let liked = false;
         try { liked = localStorage.getItem('vertex-like-' + post.id) === '1'; } catch {}
         return { ...post, liked };
       });
+    } else if (localProfile) {
+      state = { ...state, profile: localProfile };
     }
     renderProfile();
     renderProjects();
@@ -429,9 +435,9 @@
       $('#download-copy').hidden = true;
       $('#save-help').textContent = '';
     }
-    if (cloudMode && kind === 'profile') {
+    if (kind === 'profile') {
       editor.version = cloudProfile?.version || 0;
-      $('#save-button').textContent = '保存到云端';
+      $('#save-button').textContent = cloudMode ? '保存到云端' : '保存到此浏览器';
       $('#download-copy').hidden = true;
       $('#save-help').textContent = '';
     }
@@ -526,28 +532,36 @@
     saveButton.textContent = '正在保存…';
     $('#form-error').textContent = '';
     try {
-      if (cloudMode && ['post', 'profile'].includes(editor.kind)) {
+      if (editor.kind === 'profile') {
+        const profile = { siteName: value('site-name'), nickname: value('nickname'), bio: value('bio'), avatar: editor.images[0] || null };
+        if (cloudMode) {
+          cloudBusy = true;
+          editorForm.inert = true;
+          const images = await uploadEditorImages();
+          profile.avatar = images[0] || null;
+          const data = await sendMoment({ action: 'save-profile', version: editor.version, profile });
+          cloudProfile = data.profile;
+          cloudBusy = false;
+        } else {
+          try { localStorage.setItem(localProfileKey, JSON.stringify(profile)); }
+          catch { throw new Error('浏览器未能保存资料。请检查存储权限或缩小头像后重试。'); }
+          localProfile = profile;
+        }
+        renderContent();
+        closeDialog(editorDialog);
+        toast(cloudMode ? '个人资料已保存到云端。' : '个人资料已保存到此浏览器。');
+        return;
+      }
+      if (cloudMode && editor.kind === 'post') {
         cloudBusy = true;
         editorForm.inert = true;
-        if (editor.kind === 'profile') {
-          const images = await uploadEditorImages();
-          const data = await sendMoment({ action: 'save-profile', version: editor.version,
-            profile: { siteName: value('site-name'), nickname: value('nickname'), bio: value('bio'), avatar: images[0] || null } });
-          cloudProfile = data.profile;
-          renderContent();
-        } else {
-          await publishMoment(value('post-text'), value('post-tag'));
-        }
+        await publishMoment(value('post-text'), value('post-tag'));
         cloudBusy = false;
         closeDialog(editorDialog);
-        toast(editor.kind === 'profile' ? '个人资料已保存到云端。' : editor.id ? '动态已更新。' : '动态已发布。');
+        toast(editor.id ? '动态已更新。' : '动态已发布。');
         return;
       }
       const message = await saveHtml(next => {
-        if (editor.kind === 'profile') {
-          next.profile = { siteName: value('site-name'), nickname: value('nickname'), bio: value('bio'), avatar: editor.images[0] || null };
-          return;
-        }
         const collection = editor.kind === 'project' ? next.projects : next.posts;
         const existingIndex = collection.findIndex(item => item.id === editor.id);
         if (editor.id && existingIndex === -1) throw new Error('这条内容已在另一窗口中删除。请关闭窗口后重新添加。');
@@ -1253,7 +1267,9 @@
   $('#load-more').addEventListener('click', () => { visibleGames += 12; renderFullSchedule(); });
   editorDialog.addEventListener('close', () => { editorGeneration++; });
   window.addEventListener('storage', event => {
-    if (event.key !== STORAGE_KEY) return;
+    if (!cloudMode && (event.key === localProfileKey || event.key === null)) {
+      localProfile = readLocalProfile();
+    } else if (event.key !== STORAGE_KEY) return;
     try {
       state = readState();
       renderContent();
