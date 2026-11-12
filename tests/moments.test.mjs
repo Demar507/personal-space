@@ -1,0 +1,47 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { getStore } from '@netlify/blobs';
+import { BlobsServer } from '@netlify/blobs/server';
+import { handle } from '../netlify/functions/moments.mjs';
+
+test('administrator writes, public feed, image storage and conflicting edits', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'vertex-blobs-'));
+  const server = new BlobsServer({ directory, logger() {} });
+  const { address } = await server.start();
+  t.after(async () => { await server.stop(); await rm(directory, { recursive: true, force: true }); });
+  const store = getStore({ name: 'moments', siteID: 'local', apiURL: address, token: 'test', consistency: 'strong' });
+  const origin = 'https://vertex.test';
+  const call = (options = {}, query = '') => handle(new Request(origin + '/api/moments' + query, options), store, 'local-test-password');
+  const post = (body, cookie = '', source = origin) => call({ method: 'POST',
+    headers: { origin: source, cookie, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const entry = { action: 'create', id: 'test', text: '一条动态', tag: '日常', images: [] };
+  assert.equal((await post(entry)).status, 401);
+  assert.equal((await post({ action: 'login', password: 'wrong' })).status, 401);
+  const login = await post({ action: 'login', password: 'local-test-password' });
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  assert.match(login.headers.get('set-cookie'), /HttpOnly/);
+  assert.equal((await post(entry, cookie, 'https://other.test')).status, 403);
+  const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j5wAAAABJRU5ErkJggg==', 'base64');
+  const upload = await call({ method: 'POST', headers: { cookie, origin, 'Content-Type': 'image/png' }, body: bytes }, '?upload');
+  const { src } = await upload.json();
+  entry.images.push({ src, width: 1, height: 1 });
+  assert.equal((await post(entry, cookie)).status, 200);
+  const feed = await (await call()).json();
+  assert.equal(feed.admin, false);
+  assert.equal(feed.posts[0].text, entry.text);
+  const image = await call({}, new URL(src, origin).search);
+  assert.deepEqual(Buffer.from(await image.arrayBuffer()), bytes);
+  const edit = { ...entry, action: 'update', text: '已更新', version: 1 };
+  assert.equal((await post(edit)).status, 401);
+  assert.equal((await post(edit, cookie)).status, 200);
+  assert.equal((await post(edit, cookie)).status, 409);
+  const deletion = { action: 'delete', id: entry.id, version: 2 };
+  assert.equal((await post(deletion)).status, 401);
+  assert.equal((await post(deletion, cookie)).status, 200);
+  assert.deepEqual((await (await call()).json()).posts, []);
+  assert.equal((await call({}, new URL(src, origin).search)).status, 404);
+  assert.match((await post({ action: 'logout' }, cookie)).headers.get('set-cookie'), /Max-Age=0/);
+});

@@ -81,6 +81,86 @@
   const savedContent = document.querySelector('#site-content');
   let fileRevision = savedContent.dataset.revision || '';
   let fileState = savedContent.textContent.trim() ? JSON.parse(savedContent.textContent) : emptyState();
+  const cloudMode = document.documentElement.hasAttribute('data-cloud-moments');
+  const momentsApi = '/api/moments';
+  let cloudPosts = [];
+  let admin = false;
+  let cloudBusy = false;
+
+  function setAdmin(value) {
+    admin = value;
+    document.documentElement.classList.toggle('is-admin', value);
+    $('#admin-session').textContent = value ? '退出管理员' : '管理员登录';
+  }
+
+  async function requestMoments(options = {}, query = '') {
+    const response = await fetch(momentsApi + query, { cache: 'no-store', ...options });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !Object.keys(data).length) {
+      if (response.status === 401) {
+        setAdmin(false);
+        if (!$('#login-dialog').open) $('#login-dialog').showModal();
+      }
+      throw new Error(data.error || '动态服务暂时不可用，请稍后重试。');
+    }
+    return data;
+  }
+
+  function sendMoment(body) {
+    return requestMoments({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  }
+
+  async function refreshMoments() {
+    try {
+      const data = await requestMoments();
+      cloudPosts = data.posts;
+      setAdmin(data.admin);
+      renderContent();
+    } catch (error) {
+      $('#post-list').textContent = '动态读取失败，请刷新重试。';
+      toast(error.message);
+    }
+  }
+
+  async function publishMoment(text, tag) {
+    const images = [];
+    for (const image of editor.images) {
+      if (image.src.startsWith('data:')) {
+        const blob = await (await fetch(image.src)).blob();
+        const saved = await requestMoments({ method: 'POST', body: blob }, '?upload');
+        images.push({ src: saved.src, width: image.width, height: image.height });
+      } else {
+        images.push(image);
+      }
+    }
+    const data = await sendMoment({ action: editor.id ? 'update' : 'create', id: editor.id || editor.newId,
+      version: editor.version, text, tag, images });
+    cloudPosts = data.posts;
+    renderContent();
+  }
+
+  $('#admin-session')?.addEventListener('click', async () => {
+    if (!admin) {
+      $('#login-error').textContent = '';
+      $('#login-dialog').showModal();
+      return;
+    }
+    try { await sendMoment({ action: 'logout' }); setAdmin(false); }
+    catch (error) { toast(error.message); }
+  });
+  $('#login-form')?.addEventListener('submit', async event => {
+    event.preventDefault();
+    const submit = $('#login-form button[type=submit]');
+    submit.disabled = true;
+    try {
+      await sendMoment({ action: 'login', password: $('#admin-password').value });
+      $('#login-form').reset();
+      $('#login-dialog').close();
+      setAdmin(true);
+      toast('已登录，现在可以发布动态。');
+    } catch (error) { $('#login-error').textContent = error.message; }
+    finally { submit.disabled = false; }
+  });
   let siteFile;
   let fileSavePending = false;
   const canWriteHtml = window.isSecureContext && window.self === window.top && typeof window.showSaveFilePicker === 'function';
@@ -185,7 +265,7 @@
   }
 
   function validImage(image) {
-    return image && /^data:image\/(png|jpeg|webp|gif);base64,/.test(image.src || '') && Number(image.width) > 0 && Number(image.height) > 0;
+    return image && (/^data:image\/(png|jpeg|webp|gif);base64,/.test(image.src || '') || /^\/api\/moments\?image=[a-f0-9]{64}$/.test(image.src)) && Number(image.width) > 0 && Number(image.height) > 0;
   }
 
   function imageMarkup(image, alt, className = '') {
@@ -258,6 +338,13 @@
   }
 
   function renderContent() {
+    if (cloudMode) {
+      state.posts = cloudPosts.map(post => {
+        let liked = false;
+        try { liked = localStorage.getItem('vertex-like-' + post.id) === '1'; } catch {}
+        return { ...post, liked };
+      });
+    }
     renderProfile();
     renderProjects();
     renderPosts();
@@ -327,6 +414,13 @@
     $('#save-help').textContent = canWriteHtml
       ? '首次保存时，请选中正在使用的网页文件并确认替换。'
       : '下载后用新文件替换原网页，修改即可随文件保留。';
+    if (cloudMode && kind === 'post') {
+      editor.version = cloudPosts.find(post => post.id === id)?.version;
+      editor.newId = uid();
+      $('#save-button').textContent = id ? '保存修改' : '发布动态';
+      $('#download-copy').hidden = true;
+      $('#save-help').textContent = '';
+    }
     renderFilePreview();
     editorDialog.showModal();
   }
@@ -401,7 +495,7 @@
 
   editorForm.addEventListener('submit', async event => {
     event.preventDefault();
-    if (editor.loading || fileSavePending) return;
+    if (editor.loading || fileSavePending || cloudBusy) return;
     const invalid = $$('input:not([type=file]), textarea', editorForm).filter(input => !validateField(input));
     if (invalid.length) {
       $('#form-error').innerHTML = `请先完善以下内容：${invalid.map(input => `<a href="#${input.id}">${escape($(`label[for="${input.id}"]`, editorForm).childNodes[0].textContent)}</a>`).join('、')}`;
@@ -418,6 +512,15 @@
     saveButton.textContent = '正在保存…';
     $('#form-error').textContent = '';
     try {
+      if (cloudMode && editor.kind === 'post') {
+        cloudBusy = true;
+        editorForm.inert = true;
+        await publishMoment(value('post-text'), value('post-tag'));
+        cloudBusy = false;
+        closeDialog(editorDialog);
+        toast(editor.id ? '动态已更新。' : '动态已发布。');
+        return;
+      }
       const message = await saveHtml(next => {
         if (editor.kind === 'profile') {
           next.profile = { siteName: value('site-name'), nickname: value('nickname'), bio: value('bio'), avatar: editor.images[0] || null };
@@ -439,6 +542,8 @@
     } catch (error) {
       $('#form-error').textContent = error.message;
     } finally {
+      cloudBusy = false;
+      editorForm.inert = false;
       $('#download-copy').disabled = false;
       saveButton.disabled = false;
       saveButton.textContent = previousLabel;
@@ -447,13 +552,25 @@
 
   let pendingDelete = null;
   function confirmDelete(kind, id) {
-    pendingDelete = { kind, id };
+    pendingDelete = { kind, id, version: cloudPosts.find(post => post.id === id)?.version };
+    $('#confirm-dialog p').textContent = cloudMode && kind === 'post' ? '删除后，访客将无法在动态列表中看到这条记录。' : '保存后，这条内容将从网页文件中移除。';
     $('#confirm-title').textContent = kind === 'project' ? '删除这个项目？' : '删除这条心得？';
     $('#confirm-dialog').showModal();
   }
 
   $('#confirm-delete').addEventListener('click', async () => {
-    if (!pendingDelete || fileSavePending) return;
+    if (!pendingDelete || fileSavePending || cloudBusy) return;
+    if (cloudMode && pendingDelete.kind === 'post') {
+      cloudBusy = true;
+      try {
+        const data = await sendMoment({ action: 'delete', id: pendingDelete.id, version: pendingDelete.version });
+        cloudPosts = data.posts;
+        renderContent();
+        toast('动态已删除。');
+      } catch (error) { toast(error.message); }
+      finally { cloudBusy = false; pendingDelete = null; closeDialog($('#confirm-dialog')); }
+      return;
+    }
     try {
       const message = await saveHtml(next => {
         const key = pendingDelete.kind === 'project' ? 'projects' : 'posts';
@@ -993,6 +1110,15 @@
       editor.images.splice(Number(button.dataset.index), 1);
       renderFilePreview();
     }
+    if (action === 'like-post' && cloudMode) {
+      try {
+        const key = 'vertex-like-' + id;
+        if (localStorage.getItem(key) === '1') localStorage.removeItem(key);
+        else localStorage.setItem(key, '1');
+        renderContent();
+      } catch { toast('浏览器未允许保存喜欢状态。'); }
+      return;
+    }
     if (action === 'like-post') {
       try {
         commit(next => {
@@ -1254,6 +1380,7 @@
     }
   });
   function closeDialog(dialog) {
+    if (cloudBusy && (dialog === editorDialog || dialog === $("#confirm-dialog"))) return;
     if(!dialog?.open || dialog.dataset.closing) return;
     const animation=playMotion(dialog,[{opacity:1,transform:'none'},{opacity:0,transform:'translateY(14px) scale(.985)'}],{duration:180,easing:'ease-in'});
     if(!animation){dialog.close();return;}
@@ -1269,6 +1396,11 @@
   renderSchedule();
   $$('[data-year]').forEach(element => { element.textContent = new Date().getFullYear(); });
   renderRoute(true);
+  if (cloudMode) {
+    $('.moments-aside .small-muted').textContent = '在这里，记录生活里的文字和照片。';
+    $('#post-list').textContent = '正在读取动态…';
+    refreshMoments();
+  }
   $('#sync-status').textContent = cachedLabel();
   refreshSchedule(true);
   setInterval(refreshStandings, 60000);
