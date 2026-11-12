@@ -36,6 +36,35 @@ async function upload(req, store) {
   return json({ src: imagePrefix + key });
 }
 
+async function storedImage(img, store) {
+  if (!img || typeof img.src !== 'string' || !img.src.startsWith(imagePrefix) ||
+      !imageKey.test(img.src.slice(imagePrefix.length)) ||
+      ![img.width, img.height].every(n => Number.isSafeInteger(n) && n > 0) ||
+      !await store.getMetadata('images/' + img.src.slice(imagePrefix.length))) return null;
+  return { src: img.src, width: img.width, height: img.height };
+}
+
+async function saveProfile(body, store) {
+  const { siteName, nickname, bio, avatar } = body.profile || {};
+  if (typeof siteName !== 'string' || !siteName.trim() || siteName.length > 10 ||
+      typeof nickname !== 'string' || !nickname.trim() || nickname.length > 20 ||
+      typeof bio !== 'string' || bio.length > 160 ||
+      !Number.isSafeInteger(body.version) || body.version < 0) {
+    return fail('请检查网站名称、昵称和简介。', 400);
+  }
+  const photo = avatar === null ? null : await storedImage(avatar, store);
+  if (avatar !== null && !photo) return fail('头像未上传或格式无效。', 400);
+  const snapshot = await store.getWithMetadata('profile', { type: 'json' });
+  const version = snapshot?.data.version || 0;
+  const conflict = () => fail('个人资料已在其他窗口更新，请刷新后再试。', 409);
+  if (body.version !== version) return conflict();
+  const profile = { siteName: siteName.trim(), nickname: nickname.trim(), bio: bio.trim(),
+    avatar: photo, version: version + 1 };
+  const result = await store.setJSON('profile', profile,
+    snapshot ? { onlyIfMatch: snapshot.etag } : { onlyIfNew: true });
+  return result.modified ? json({ profile }) : conflict();
+}
+
 export async function handle(req, store, secret) {
   const url = new URL(req.url);
   const admin = sessionValid(req, secret);
@@ -44,13 +73,16 @@ export async function handle(req, store, secret) {
     if (key !== null) {
       if (!imageKey.test(key)) return fail('图片不存在。', 404);
       const posts = await store.get('posts', { type: 'json' }) || [];
-      if (!posts.some(post => post.images.some(photo => photo.src === imagePrefix + key))) return fail('图片不存在。', 404);
+      const profile = await store.get('profile', { type: 'json' });
+      if (profile?.avatar?.src !== imagePrefix + key &&
+          !posts.some(post => post.images.some(photo => photo.src === imagePrefix + key))) return fail('图片不存在。', 404);
       const image = await store.getWithMetadata('images/' + key, { type: 'arrayBuffer' });
       if (!image) return fail('图片不存在。', 404);
       return new Response(image.data, { headers: { 'Content-Type': image.metadata.type,
         'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' } });
     }
-    return json({ posts: await store.get('posts', { type: 'json' }) || [], admin });
+    return json({ posts: await store.get('posts', { type: 'json' }) || [],
+      profile: await store.get('profile', { type: 'json' }), admin });
   }
 
   if (req.method !== 'POST') return fail('请求方式无效。', 405);
@@ -70,7 +102,8 @@ export async function handle(req, store, secret) {
     return json({ admin: true }, 200, { 'Set-Cookie': 'vertex_admin=' + token + '.' + sign(token, secret) + cookie + '; Max-Age=' + sessionLife });
   }
   if (body.action === 'logout') return json({ admin: false }, 200, { 'Set-Cookie': 'vertex_admin=' + cookie + '; Max-Age=0' });
-  if (!admin) return fail('请重新登录后发布。', 401);
+  if (!admin) return fail('请重新登录后保存。', 401);
+  if (body.action === 'save-profile') return saveProfile(body, store);
   if (!['create', 'update', 'delete'].includes(body.action) || typeof body.id !== 'string' ||
       !/^[a-zA-Z0-9-]{1,80}$/.test(body.id)) return fail('动态编号无效。', 400);
 
@@ -87,10 +120,9 @@ export async function handle(req, store, secret) {
         !Array.isArray(images) || images.length > 3) return fail('请检查动态文字、分类和配图。', 400);
     const photos = [];
     for (const img of images) {
-      if (!img || typeof img.src !== 'string' || !img.src.startsWith(imagePrefix) ||
-          !imageKey.test(img.src.slice(imagePrefix.length)) || ![img.width,img.height].every(n => Number.isSafeInteger(n) && n > 0) ||
-          !await store.getMetadata('images/' + img.src.slice(imagePrefix.length))) return fail('配图未上传或格式无效。', 400);
-      photos.push({ src: img.src, width: img.width, height: img.height });
+      const photo = await storedImage(img, store);
+      if (!photo) return fail('配图未上传或格式无效。', 400);
+      photos.push(photo);
     }
     const post = { id: body.id, text: text.trim(), tag, images: photos, version: (existing?.version || 0) + 1,
       createdAt: existing?.createdAt || new Date().toISOString(), edited: Boolean(existing) };

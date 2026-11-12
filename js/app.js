@@ -84,6 +84,7 @@
   const cloudMode = document.documentElement.hasAttribute('data-cloud-moments');
   const momentsApi = '/api/moments';
   let cloudPosts = [];
+  let cloudProfile = null;
   let admin = false;
   let cloudBusy = false;
 
@@ -114,6 +115,7 @@
     try {
       const data = await requestMoments();
       cloudPosts = data.posts;
+      cloudProfile = data.profile || null;
       setAdmin(data.admin);
       renderContent();
     } catch (error) {
@@ -122,7 +124,7 @@
     }
   }
 
-  async function publishMoment(text, tag) {
+  async function uploadEditorImages() {
     const images = [];
     for (const image of editor.images) {
       if (image.src.startsWith('data:')) {
@@ -133,6 +135,11 @@
         images.push(image);
       }
     }
+    return images;
+  }
+
+  async function publishMoment(text, tag) {
+    const images = await uploadEditorImages();
     const data = await sendMoment({ action: editor.id ? 'update' : 'create', id: editor.id || editor.newId,
       version: editor.version, text, tag, images });
     cloudPosts = data.posts;
@@ -339,6 +346,7 @@
 
   function renderContent() {
     if (cloudMode) {
+      state.profile = cloudProfile || { ...DEFAULT_PROFILE, ...fileState.profile };
       state.posts = cloudPosts.map(post => {
         let liked = false;
         try { liked = localStorage.getItem('vertex-like-' + post.id) === '1'; } catch {}
@@ -418,6 +426,12 @@
       editor.version = cloudPosts.find(post => post.id === id)?.version;
       editor.newId = uid();
       $('#save-button').textContent = id ? '保存修改' : '发布动态';
+      $('#download-copy').hidden = true;
+      $('#save-help').textContent = '';
+    }
+    if (cloudMode && kind === 'profile') {
+      editor.version = cloudProfile?.version || 0;
+      $('#save-button').textContent = '保存到云端';
       $('#download-copy').hidden = true;
       $('#save-help').textContent = '';
     }
@@ -512,13 +526,21 @@
     saveButton.textContent = '正在保存…';
     $('#form-error').textContent = '';
     try {
-      if (cloudMode && editor.kind === 'post') {
+      if (cloudMode && ['post', 'profile'].includes(editor.kind)) {
         cloudBusy = true;
         editorForm.inert = true;
-        await publishMoment(value('post-text'), value('post-tag'));
+        if (editor.kind === 'profile') {
+          const images = await uploadEditorImages();
+          const data = await sendMoment({ action: 'save-profile', version: editor.version,
+            profile: { siteName: value('site-name'), nickname: value('nickname'), bio: value('bio'), avatar: images[0] || null } });
+          cloudProfile = data.profile;
+          renderContent();
+        } else {
+          await publishMoment(value('post-text'), value('post-tag'));
+        }
         cloudBusy = false;
         closeDialog(editorDialog);
-        toast(editor.id ? '动态已更新。' : '动态已发布。');
+        toast(editor.kind === 'profile' ? '个人资料已保存到云端。' : editor.id ? '动态已更新。' : '动态已发布。');
         return;
       }
       const message = await saveHtml(next => {
